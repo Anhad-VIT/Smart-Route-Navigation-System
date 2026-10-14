@@ -1,6 +1,7 @@
 numpy>=2.0
 pandas>=2.0
 streamlit>=1.35
+pydeck>=0.8
 # Optional advanced mode: live OSM topology and gradient-boosted prediction.
 osmnx>=2.0
 xgboost>=2.1

@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import json
 import math
+from functools import lru_cache
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from pathlib import Path
@@ -21,9 +22,11 @@ except ImportError:
 
 DATA_PATH = Path(__file__).parent / "data" / "Metro_Interstate_Traffic_Volume.csv"
 VOLUME_CAPACITY = 7_000.0
+_xgb_model_cache: dict[int, tuple[pd.DataFrame, Any]] = {}
 
 
-def load_traffic_data(path: Path = DATA_PATH) -> pd.DataFrame:
+@lru_cache(maxsize=4)
+def _load_traffic_data_cached(path: str, modified_ns: int, file_size: int) -> pd.DataFrame:
 	"""Load the UCI records and add cyclic temporal features."""
 	frame = pd.read_csv(path)
 	frame["date_time"] = pd.to_datetime(frame["date_time"])
@@ -36,13 +39,25 @@ def load_traffic_data(path: Path = DATA_PATH) -> pd.DataFrame:
 	return frame
 
 
+def load_traffic_data(path: Path = DATA_PATH) -> pd.DataFrame:
+	"""Load and cache traffic records until the source file changes."""
+	path = path.resolve()
+	stat = path.stat()
+	return _load_traffic_data_cached(str(path), stat.st_mtime_ns, stat.st_size)
+
+
 def predict_volume(frame: pd.DataFrame, departure: pd.Timestamp, use_ml: bool = True) -> float:
 	"""Predict volume with XGBoost when available, otherwise use a robust profile."""
 	if use_ml and XGBRegressor is not None:
-		features = ["hour_sin", "hour_cos", "day_of_week", "month", "temp", "rain_1h", "snow_1h", "clouds_all"]
-		train = frame.dropna(subset=features + ["traffic_volume"])
-		model = XGBRegressor(n_estimators=120, max_depth=4, learning_rate=0.08, objective="reg:squarederror", n_jobs=2)
-		model.fit(train[features], train["traffic_volume"])
+		model_entry = _xgb_model_cache.get(id(frame))
+		if model_entry is None or model_entry[0] is not frame:
+			features = ["hour_sin", "hour_cos", "day_of_week", "month", "temp", "rain_1h", "snow_1h", "clouds_all"]
+			train = frame.dropna(subset=features + ["traffic_volume"])
+			model = XGBRegressor(n_estimators=120, max_depth=4, learning_rate=0.08, objective="reg:squarederror", n_jobs=2, tree_method="hist")
+			model.fit(train[features], train["traffic_volume"])
+			_xgb_model_cache[id(frame)] = (frame, model)
+		else:
+			model = model_entry[1]
 		timestamp = pd.DataFrame([{
 			"hour_sin": math.sin(2 * math.pi * departure.hour / 24),
 			"hour_cos": math.cos(2 * math.pi * departure.hour / 24),
@@ -66,12 +81,11 @@ def forecast_metrics(frame: pd.DataFrame) -> dict[str, float]:
 	split = int(len(frame) * 0.8)
 	train, test = frame.iloc[:split], frame.iloc[split:]
 	profiles = train.groupby(["hour", "is_weekend"])["traffic_volume"].median()
-	predictions = [
-		profiles.get((row.hour, row.is_weekend), train["traffic_volume"].median())
-		for row in test.itertuples()
-	]
+	profile_keys = pd.MultiIndex.from_arrays([test["hour"], test["is_weekend"]])
+	fallback = float(train["traffic_volume"].median())
+	predictions = profiles.reindex(profile_keys).fillna(fallback).to_numpy(dtype=float)
 	actual = test["traffic_volume"].to_numpy(dtype=float)
-	predicted = np.asarray(predictions, dtype=float)
+	predicted = predictions
 	error = actual - predicted
 	ss_total = np.sum((actual - actual.mean()) ** 2)
 	return {
@@ -284,11 +298,18 @@ def astar_route(graph: dict[str, dict[str, Any]], start: str, goal: str, volume:
 	def heuristic(node: str) -> float:
 		return haversine_km(graph[node], graph[goal]) / maximum_speed * 60
 
-	queue: list[tuple[float, float, str, list[str]]] = [(heuristic(start), 0.0, start, [start])]
+	queue: list[tuple[float, float, str]] = [(heuristic(start), 0.0, start)]
 	best_cost = {start: 0.0}
+	previous: dict[str, str | None] = {start: None}
 	while queue:
-		_, cost, node, path = heapq.heappop(queue)
+		_, cost, node = heapq.heappop(queue)
 		if node == goal:
+			path: list[str] = []
+			current: str | None = goal
+			while current is not None:
+				path.append(current)
+				current = previous[current]
+			path.reverse()
 			return path, cost
 		if cost > best_cost.get(node, float("inf")):
 			continue
@@ -297,7 +318,8 @@ def astar_route(graph: dict[str, dict[str, Any]], start: str, goal: str, volume:
 			next_cost = cost + edge_cost(edge, volume, weather_penalty, incident_penalty, multiplier)
 			if next_cost < best_cost.get(neighbor, float("inf")):
 				best_cost[neighbor] = next_cost
-				heapq.heappush(queue, (next_cost + heuristic(neighbor), next_cost, neighbor, path + [neighbor]))
+				previous[neighbor] = node
+				heapq.heappush(queue, (next_cost + heuristic(neighbor), next_cost, neighbor))
 	raise ValueError(f"No route exists between {start} and {goal}")
 
 
@@ -319,11 +341,13 @@ def evaluate_route_checkpoints(
 	use_ml: bool = True,
 	checkpoint_interval_minutes: int = 60,
 	congestion_threshold: float = 0.75,
+	frame: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
 	"""Flag congested checkpoints and re-search a route after an interval if conditions worsen."""
 	if len(path) < 2:
 		return {"checkpoints": [], "reroute": None, "reason": "Route is too short to evaluate checkpoints."}
-	frame = load_traffic_data()
+	if frame is None:
+		frame = load_traffic_data()
 	current_time = pd.Timestamp(departure)
 	accumulated_minutes = 0.0
 	checkpoints: list[dict[str, Any]] = []
@@ -398,13 +422,13 @@ def shortest_distance_path(graph: dict[str, dict[str, Any]], start: str, goal: s
 	return path, best_cost[goal]
 
 
-def route_score(graph: dict[str, dict[str, Any]], path: list[str], volume: float, weather_penalty: float = 0.0, incident_penalty: float = 0.0) -> tuple[float, dict[str, float]]:
+def route_score(graph: dict[str, dict[str, Any]], path: list[str], volume: float, weather_penalty: float = 0.0, incident_penalty: float = 0.0, reference_distance_km: float | None = None) -> tuple[float, dict[str, float]]:
 	"""Score a route using geometry, time, and congestion while keeping A* heuristics in the search layer."""
 	metrics = route_summary(graph, path, volume, weather_penalty, incident_penalty)
-	geometry_only_path, base_distance = shortest_distance_path(graph, path[0], path[-1])
-	geometry_only_distance = route_summary(graph, geometry_only_path, volume, weather_penalty, incident_penalty)["distance_km"]
+	if reference_distance_km is None:
+		_, reference_distance_km = shortest_distance_path(graph, path[0], path[-1])
+	geometry_only_distance = reference_distance_km
 	geometry_only_distance = max(geometry_only_distance, 1e-6)
-	base_distance = max(base_distance, 1e-6)
 	travel_weight = 0.45
 	distance_weight = 0.35
 	congestion_weight = 0.20
@@ -430,14 +454,16 @@ def recommend_routes(departure: pd.Timestamp, weather_penalty: float = 0.0, inci
 
 	primary, _ = astar_route(graph, start, goal, volume, weather_penalty, incident_penalty)
 	alternative, _ = astar_route(graph, start, goal, volume, weather_penalty, incident_penalty, set(zip(primary, primary[1:])))
-	geometry_path, _ = shortest_distance_path(graph, start, goal)
-	long_distance_evolution = evaluate_route_checkpoints(graph, primary, pd.Timestamp(departure), weather_penalty, incident_penalty, use_ml=use_ml)
+	geometry_path, geometry_distance = shortest_distance_path(graph, start, goal)
+	long_distance_evolution = evaluate_route_checkpoints(graph, primary, pd.Timestamp(departure), weather_penalty, incident_penalty, use_ml=use_ml, frame=frame)
 
 	candidates: list[dict[str, Any]] = []
+	route_results: dict[str, dict[str, Any]] = {}
 	for label, path in (("primary", primary), ("alternative", alternative), ("shortest_distance", geometry_path)):
-		metrics = route_summary(graph, path, volume, weather_penalty, incident_penalty)
-		score, metrics = route_score(graph, path, volume, weather_penalty, incident_penalty)
-		candidate = {"route_name": label, "path": path, **metrics, "score": score}
+		score, metrics = route_score(graph, path, volume, weather_penalty, incident_penalty, geometry_distance)
+		route = {"path": path, **metrics, "score": score}
+		route_results[label] = route
+		candidate = {"route_name": label, **route}
 		candidates.append(candidate)
 
 	selected = min(candidates, key=lambda item: item["score"])
@@ -447,9 +473,9 @@ def recommend_routes(departure: pd.Timestamp, weather_penalty: float = 0.0, inci
 		"predicted_volume": volume,
 		"forecast_metrics": forecast_metrics(frame),
 		"graph": graph,
-		"primary": {"path": primary, **route_summary(graph, primary, volume, weather_penalty, incident_penalty), "score": route_score(graph, primary, volume, weather_penalty, incident_penalty)[0]},
-		"alternative": {"path": alternative, **route_summary(graph, alternative, volume, weather_penalty, incident_penalty), "score": route_score(graph, alternative, volume, weather_penalty, incident_penalty)[0]},
-		"shortest_distance": {"path": geometry_path, **route_summary(graph, geometry_path, volume, weather_penalty, incident_penalty), "score": route_score(graph, geometry_path, volume, weather_penalty, incident_penalty)[0]},
+		"primary": route_results["primary"],
+		"alternative": route_results["alternative"],
+		"shortest_distance": route_results["shortest_distance"],
 		"selected_route": {"path": selected_path, **selected_metrics, "score": selected["score"]},
 		"route_evolution": long_distance_evolution,
 	}

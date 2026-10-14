@@ -6,9 +6,36 @@ import pandas as pd
 import streamlit as st
 
 from traffic_analysis import build_demo_graph, geocode_landmark, load_osm_graph, load_traffic_data, nearest_node, predict_volume, recommend_routes, route_intercity_osrm
+from route_visualization import build_route_deck
 
 
 st.set_page_config(page_title="SmartRoute AI", page_icon="S", layout="wide")
+
+
+@st.cache_data(ttl=86_400, max_entries=4)
+def cached_osm_graph(place: str):
+    return load_osm_graph(place)
+
+
+@st.cache_data(ttl=86_400, max_entries=128)
+def cached_geocode(landmark: str, place: str):
+    return geocode_landmark(landmark, place)
+
+
+@st.cache_data(ttl=300, max_entries=32)
+def cached_intercity_route(origin_coordinates, destination_coordinates, volume, weather, incident, departure):
+    frame = load_traffic_data()
+    return route_intercity_osrm(
+        origin_coordinates,
+        destination_coordinates,
+        volume,
+        weather,
+        incident,
+        departure=departure,
+        frame=frame,
+    )
+
+
 st.title("SmartRoute AI")
 st.caption("Predictive traffic intelligence and congestion-aware route recommendations")
 
@@ -36,11 +63,18 @@ with st.sidebar:
 graph = build_demo_graph()
 if travel_mode == "Intercity / long travel":
     try:
-        origin_coordinates = geocode_landmark(origin, origin_place)
-        destination_coordinates = geocode_landmark(destination, destination_place)
+        origin_coordinates = cached_geocode(origin, origin_place)
+        destination_coordinates = cached_geocode(destination, destination_place)
         frame = load_traffic_data()
         volume = predict_volume(frame, pd.Timestamp(departure), use_ml=use_ml)
-        result = route_intercity_osrm(origin_coordinates, destination_coordinates, volume, weather_penalty, incident_penalty)
+        result = cached_intercity_route(
+            origin_coordinates,
+            destination_coordinates,
+            volume,
+            weather_penalty,
+            incident_penalty,
+            departure,
+        )
         result["predicted_volume"] = volume
         result["forecast_metrics"] = {"MAE": float("nan"), "RMSE": float("nan"), "R2": float("nan")}
         st.success("Intercity route loaded through OSRM")
@@ -51,9 +85,9 @@ elif use_live_map:
     try:
         if not place:
             raise ValueError("OSM place is empty. Enter a city or region name.")
-        graph = load_osm_graph(place)
-        origin_lat, origin_lon = geocode_landmark(origin, place)
-        destination_lat, destination_lon = geocode_landmark(destination, place)
+        graph = cached_osm_graph(place)
+        origin_lat, origin_lon = cached_geocode(origin, place)
+        destination_lat, destination_lon = cached_geocode(destination, place)
         start_node = nearest_node(graph, origin_lat, origin_lon)
         goal_node = nearest_node(graph, destination_lat, destination_lon)
         result = recommend_routes(pd.Timestamp(departure), weather_penalty, incident_penalty, graph, use_ml, start_node, goal_node)
@@ -89,18 +123,18 @@ with left:
     evolution = result.get("route_evolution", {})
     reroute = evolution.get("reroute")
     if reroute:
-        old_points = [{"route": "Old route", "sequence": sequence, "lat": graph[node]["lat"], "lon": graph[node]["lon"], "node": node} for sequence, node in enumerate(primary["path"])]
-        new_points = [{"route": "New route", "sequence": sequence, "lat": graph[node]["lat"], "lon": graph[node]["lon"], "node": node} for sequence, node in enumerate(reroute["path"])]
         st.info(reroute["reason"])
-        st.map(pd.DataFrame(old_points), latitude="lat", longitude="lon", size=30, color="#b0bec5")
-        st.map(pd.DataFrame(new_points), latitude="lat", longitude="lon", size=35, color="#ef8354")
+        route_deck = build_route_deck(graph, [
+            {"label": "Previous route", "path": primary["path"], "color": [148, 163, 184]},
+            {"label": "Recommended reroute", "path": reroute["path"], "color": [239, 131, 84]},
+        ])
     else:
-        route_points = []
-        for route_name, route in ((primary_label, primary), ("Alternative", alternative)):
-            for sequence, node in enumerate(route["path"]):
-                route_points.append({"route": route_name, "sequence": sequence, "lat": graph[node]["lat"], "lon": graph[node]["lon"], "node": node})
-        points = pd.DataFrame(route_points)
-        st.map(points, latitude="lat", longitude="lon", size=30, color="#ef8354")
+        route_deck = build_route_deck(graph, [
+            {"label": primary_label, "path": primary["path"], "color": [239, 131, 84]},
+            {"label": "Alternative", "path": alternative["path"], "color": [56, 189, 248]},
+        ])
+    if route_deck is not None:
+        st.pydeck_chart(route_deck, use_container_width=True, height=480)
 
     checkpoints = evolution.get("checkpoints", [])
     if checkpoints:

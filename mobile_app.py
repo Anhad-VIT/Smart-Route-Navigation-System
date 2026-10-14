@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import streamlit as st
+from route_visualization import build_route_deck
 
 st.set_page_config(page_title="SmartRoute Mobile", page_icon="🚗", layout="centered")
 
@@ -56,19 +57,12 @@ if submitted:
             st.caption(f"Route: {' -> '.join(primary['path'])}")
 
             graph = result.get("graph", {})
-            route_points = []
-            for sequence, node in enumerate(primary.get("path", [])):
-                point = graph.get(node)
-                if point is None:
-                    continue
-                route_points.append({
-                    "sequence": sequence,
-                    "lat": float(point["lat"]),
-                    "lon": float(point["lon"]),
-                    "label": node,
-                })
-            if route_points:
+            route_deck = build_route_deck(graph, [
+                {"label": "Recommended route", "path": primary.get("path", []), "color": [239, 131, 84]},
+                {"label": "Alternative", "path": alternative.get("path", []), "color": [56, 189, 248]},
+            ])
+            if route_deck is not None:
                 st.subheader("Map view")
-                st.map(route_points, latitude="lat", longitude="lon")
+                st.pydeck_chart(route_deck, use_container_width=True, height=480)
     except Exception as exc:  # pragma: no cover - UI error path
         st.error(f"Route generation failed: {exc}")
