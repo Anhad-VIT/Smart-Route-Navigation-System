@@ -5,11 +5,12 @@ from __future__ import annotations
 import heapq
 import json
 import math
+import time
 from functools import lru_cache
+from pathlib import Path
 from threading import Lock
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -25,8 +26,10 @@ except ImportError:
 DATA_PATH = Path(__file__).parent / "data" / "Metro_Interstate_Traffic_Volume.csv"
 VOLUME_CAPACITY = 7_000.0
 GEOCODING_REQUEST_TIMEOUT_SECONDS = 20.0
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 _xgb_model_cache: dict[int, tuple[pd.DataFrame, Any]] = {}
-_osmnx_request_lock = Lock()
+_nominatim_request_lock = Lock()
+_last_nominatim_request_at = 0.0
 
 
 @lru_cache(maxsize=4)
@@ -135,8 +138,7 @@ def load_osm_graph(place: str, network_type: str = "drive") -> dict[str, dict[st
 		import osmnx as ox
 	except ImportError as error:
 		raise RuntimeError("Install osmnx to use live OpenStreetMap routing.") from error
-	with _osmnx_request_lock:
-		network = ox.graph_from_place(place, network_type=network_type, simplify=True)
+	network = ox.graph_from_place(place, network_type=network_type, simplify=True)
 	normalized: dict[str, dict[str, Any]] = {}
 	for node, data in network.nodes(data=True):
 		normalized[str(node)] = {"lat": float(data["y"]), "lon": float(data["x"]), "edges": {}}
@@ -148,6 +150,32 @@ def load_osm_graph(place: str, network_type: str = "drive") -> dict[str, dict[st
 	return normalized
 
 
+@lru_cache(maxsize=256)
+def _geocode_nominatim_query(candidate: str, place: str) -> tuple[float, float] | None:
+	"""Make one cached, bounded Nominatim request without unbounded retries."""
+	global _last_nominatim_request_at
+	params = {"format": "json", "limit": 1, "dedupe": 0, "q": f"{candidate}, {place}"}
+	with _nominatim_request_lock:
+		delay = 1.0 - (time.monotonic() - _last_nominatim_request_at)
+		if delay > 0:
+			time.sleep(delay)
+		_last_nominatim_request_at = time.monotonic()
+		response = requests.get(
+			NOMINATIM_SEARCH_URL,
+			params=params,
+			timeout=(5.0, GEOCODING_REQUEST_TIMEOUT_SECONDS),
+			headers={
+				"User-Agent": "SmartRouteAI/1.0 (OpenStreetMap Nominatim geocoding)",
+				"Accept": "application/json",
+			},
+		)
+	response.raise_for_status()
+	results = response.json()
+	if not results:
+		return None
+	return float(results[0]["lat"]), float(results[0]["lon"])
+
+
 def geocode_landmark(landmark: str, place: str) -> tuple[float, float]:
 	"""Resolve a landmark name within a place using OpenStreetMap Nominatim."""
 	landmark = landmark.strip()
@@ -156,10 +184,6 @@ def geocode_landmark(landmark: str, place: str) -> tuple[float, float]:
 		raise ValueError("Enter a landmark name.")
 	if not place:
 		raise ValueError("Enter an OSM place before searching for landmarks.")
-	try:
-		import osmnx as ox
-	except ImportError as error:
-		raise RuntimeError("Install osmnx to search landmarks.") from error
 	candidates = [landmark]
 	for suffix in (" Main Gate", " Railway Station", " Station"):
 		if landmark.lower().endswith(suffix.lower()):
@@ -167,14 +191,9 @@ def geocode_landmark(landmark: str, place: str) -> tuple[float, float]:
 	last_error: Exception | None = None
 	for candidate in candidates:
 		try:
-			with _osmnx_request_lock:
-				previous_timeout = ox.settings.requests_timeout
-				try:
-					ox.settings.requests_timeout = GEOCODING_REQUEST_TIMEOUT_SECONDS
-					latitude, longitude = ox.geocode(f"{candidate}, {place}")
-				finally:
-					ox.settings.requests_timeout = previous_timeout
-			return float(latitude), float(longitude)
+			coordinates = _geocode_nominatim_query(candidate, place)
+			if coordinates is not None:
+				return coordinates
 		except requests.exceptions.RequestException:
 			raise
 		except Exception as error:
