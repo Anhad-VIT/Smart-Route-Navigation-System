@@ -6,6 +6,7 @@ import heapq
 import json
 import math
 from functools import lru_cache
+from threading import Lock
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 
 try:
 	from xgboost import XGBRegressor
@@ -22,7 +24,9 @@ except ImportError:
 
 DATA_PATH = Path(__file__).parent / "data" / "Metro_Interstate_Traffic_Volume.csv"
 VOLUME_CAPACITY = 7_000.0
+GEOCODING_REQUEST_TIMEOUT_SECONDS = 20.0
 _xgb_model_cache: dict[int, tuple[pd.DataFrame, Any]] = {}
+_osmnx_request_lock = Lock()
 
 
 @lru_cache(maxsize=4)
@@ -131,7 +135,8 @@ def load_osm_graph(place: str, network_type: str = "drive") -> dict[str, dict[st
 		import osmnx as ox
 	except ImportError as error:
 		raise RuntimeError("Install osmnx to use live OpenStreetMap routing.") from error
-	network = ox.graph_from_place(place, network_type=network_type, simplify=True)
+	with _osmnx_request_lock:
+		network = ox.graph_from_place(place, network_type=network_type, simplify=True)
 	normalized: dict[str, dict[str, Any]] = {}
 	for node, data in network.nodes(data=True):
 		normalized[str(node)] = {"lat": float(data["y"]), "lon": float(data["x"]), "edges": {}}
@@ -162,8 +167,16 @@ def geocode_landmark(landmark: str, place: str) -> tuple[float, float]:
 	last_error: Exception | None = None
 	for candidate in candidates:
 		try:
-			latitude, longitude = ox.geocode(f"{candidate}, {place}")
+			with _osmnx_request_lock:
+				previous_timeout = ox.settings.requests_timeout
+				try:
+					ox.settings.requests_timeout = GEOCODING_REQUEST_TIMEOUT_SECONDS
+					latitude, longitude = ox.geocode(f"{candidate}, {place}")
+				finally:
+					ox.settings.requests_timeout = previous_timeout
 			return float(latitude), float(longitude)
+		except requests.exceptions.RequestException:
+			raise
 		except Exception as error:
 			last_error = error
 	raise ValueError(f"Could not find '{landmark}' in {place}.") from last_error

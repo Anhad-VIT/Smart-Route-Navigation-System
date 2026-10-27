@@ -17,7 +17,11 @@ def cached_osm_graph(place: str):
     return load_osm_graph(place)
 
 
-@st.cache_data(ttl=86_400, max_entries=128)
+@st.cache_data(
+    ttl=86_400,
+    max_entries=128,
+    show_spinner="Looking up landmarks with OpenStreetMap...",
+)
 def cached_geocode(landmark: str, place: str):
     return geocode_landmark(landmark, place)
 
